@@ -52,6 +52,10 @@ def _standardize_input_data(data, names, shapes=None,
         ValueError: in case of improperly formatted user-provided data.
     """
     if not names:
+        if data:
+            raise ValueError('Error when checking model ' +
+                             exception_prefix + ': '
+                             'expected no data, but got:', data)
         return []
     if data is None:
         return [None for _ in range(len(names))]
@@ -72,7 +76,7 @@ def _standardize_input_data(data, names, shapes=None,
                                  'that you are passing to your model '
                                  'is not the size the model expected. '
                                  'Expected to see ' + str(len(names)) +
-                                 ' arrays but instead got '
+                                 ' array(s), but instead got '
                                  'the following list of ' + str(len(data)) +
                                  ' arrays: ' + str(data)[:200] +
                                  '...')
@@ -465,46 +469,6 @@ def _weighted_masked_objective(fn):
     return weighted
 
 
-def _masked_objective(fn):
-    """Adds support for masking to an objective function.
-
-    It transforms an objective function `fn(y_true, y_pred)`
-    into a cost-masked objective function
-    `fn(y_true, y_pred, mask)`.
-
-    # Arguments
-        fn: The objective function to wrap,
-            with signature `fn(y_true, y_pred)`.
-
-    # Returns
-        A function with signature `fn(y_true, y_pred, mask)`.
-    """
-    def masked(y_true, y_pred, mask=None):
-        """Wrapper function.
-
-        # Arguments
-            y_true: `y_true` argument of `fn`.
-            y_pred: `y_pred` argument of `fn`.
-            mask: Mask tensor.
-
-        # Returns
-            Scalar tensor.
-        """
-        # score_array has ndim >= 2
-        score_array = fn(y_true, y_pred)
-        if mask is not None:
-            # Cast the mask to floatX to avoid float64 upcasting in theano
-            mask = K.cast(mask, K.floatx())
-            # mask should have the same shape as score_array
-            score_array *= mask
-            #  the loss per batch should be proportional
-            #  to the number of unmasked samples.
-            score_array /= K.mean(mask)
-
-        return K.mean(score_array)
-    return masked
-
-
 def _standardize_weights(y, sample_weight=None, class_weight=None,
                          sample_weight_mode=None):
     """Performs sample weight validation and standardization.
@@ -604,7 +568,8 @@ class Model(Container):
     """
 
     def compile(self, optimizer, loss, metrics=None, loss_weights=None,
-                sample_weight_mode=None, **kwargs):
+                sample_weight_mode=None, weighted_metrics=None,
+                target_tensors=None, **kwargs):
         """Configures the model for training.
 
         # Arguments
@@ -637,6 +602,16 @@ class Model(Container):
                 If the model has multiple outputs, you can use a different
                 `sample_weight_mode` on each output by passing a
                 dictionary or a list of modes.
+            target_tensors: by default, Keras will create placeholders for the
+                model's target, which will be fed with the target data during
+                training. If instead you would like to use your own
+                target tensors (in turn, Keras will not expect external
+                Numpy data for these targets at training time), you
+                can specify them via the `target_tensors` argument. It can be
+                a single tensor (for a single-output model), a list of tensors,
+                or a dict mapping output names to target tensors.
+            weighted_metrics: list of metrics to be evaluated and weighted
+                by sample_weight or class_weight during training and testing
             **kwargs: when using the Theano/CNTK backends, these arguments
                 are passed into K.function. When using the TensorFlow backend,
                 these arguments are passed into `tf.Session.run`.
@@ -682,19 +657,16 @@ class Model(Container):
             loss_functions = [loss_function for _ in range(len(self.outputs))]
         self.loss_functions = loss_functions
         weighted_losses = [_weighted_masked_objective(fn) for fn in loss_functions]
-        skip_indices = []
+        skip_target_indices = []
+        skip_target_weighing_indices = []
         self._feed_outputs = []
         self._feed_output_names = []
         self._feed_output_shapes = []
         self._feed_loss_fns = []
         for i in range(len(weighted_losses)):
             if weighted_losses[i] is None:
-                skip_indices.append(i)
-            else:
-                self._feed_outputs.append(self.outputs[i])
-                self._feed_output_names.append(self.output_names[i])
-                self._feed_output_shapes.append(self.internal_output_shapes[i])
-                self._feed_loss_fns.append(self.loss_functions[i])
+                skip_target_indices.append(i)
+                skip_target_weighing_indices.append(i)
 
         # Prepare output masks.
         masks = self.compute_mask(self.inputs, mask=None)
@@ -729,6 +701,57 @@ class Model(Container):
                             str(loss_weights) +
                             ' - expected a list of dicts.')
 
+        # Prepare targets of model.
+        self.targets = []
+        self._feed_targets = []
+        if target_tensors is not None:
+            if isinstance(target_tensors, list):
+                if len(target_tensors) != len(self.outputs):
+                    raise ValueError(
+                        'When passing a list as `target_tensors`, '
+                        'it should have one entry per model outputs. '
+                        'The model has ' + str(len(self.outputs)) +
+                        ' outputs, but you passed target_tensors=' +
+                        str(target_tensors))
+            elif isinstance(target_tensors, dict):
+                for name in target_tensors:
+                    if name not in self.output_names:
+                        raise ValueError('Unknown entry in `target_tensors` '
+                                         'dictionary: "' + name + '". '
+                                         'Only expected the following keys: ' +
+                                         str(self.output_names))
+                _target_tensors = []
+                for name in self.output_names:
+                    _target_tensors.append(target_tensors.get(name, None))
+                target_tensors = _target_tensors
+            else:
+                raise TypeError('Expected `target_tensors` to be '
+                                'a list or dict, but got:', target_tensors)
+        for i in range(len(self.outputs)):
+            if i in skip_target_indices:
+                self.targets.append(None)
+            else:
+                shape = self.internal_output_shapes[i]
+                name = self.output_names[i]
+                if target_tensors is not None:
+                    target = target_tensors[i]
+                else:
+                    target = None
+                if target is None or K.is_placeholder(target):
+                    if target is None:
+                        target = K.placeholder(ndim=len(shape),
+                                               name=name + '_target',
+                                               sparse=K.is_sparse(self.outputs[i]),
+                                               dtype=K.dtype(self.outputs[i]))
+                    self._feed_targets.append(target)
+                    self._feed_outputs.append(self.outputs[i])
+                    self._feed_output_names.append(name)
+                    self._feed_output_shapes.append(shape)
+                    self._feed_loss_fns.append(self.loss_functions[i])
+                else:
+                    skip_target_weighing_indices.append(i)
+                self.targets.append(target)
+
         # Prepare sample weights.
         sample_weights = []
         sample_weight_modes = []
@@ -741,7 +764,7 @@ class Model(Container):
                                      'Only expected the following keys: ' +
                                      str(self.output_names))
             for i, name in enumerate(self.output_names):
-                if i in skip_indices:
+                if i in skip_target_weighing_indices:
                     weight = None
                     sample_weight_modes.append(None)
                 else:
@@ -767,7 +790,7 @@ class Model(Container):
                                  'sample_weight_mode=' +
                                  str(sample_weight_mode))
             for i in range(len(self.output_names)):
-                if i in skip_indices:
+                if i in skip_target_weighing_indices:
                     weight = None
                     sample_weight_modes.append(None)
                 else:
@@ -784,7 +807,7 @@ class Model(Container):
                 sample_weights.append(weight)
         else:
             for i, name in enumerate(self.output_names):
-                if i in skip_indices:
+                if i in skip_target_weighing_indices:
                     sample_weight_modes.append(None)
                     sample_weights.append(None)
                 else:
@@ -801,113 +824,112 @@ class Model(Container):
         self.sample_weight_modes = sample_weight_modes
         self._feed_sample_weight_modes = []
         for i in range(len(self.outputs)):
-            if i not in skip_indices:
+            if i not in skip_target_weighing_indices:
                 self._feed_sample_weight_modes.append(self.sample_weight_modes[i])
-
-        # Prepare targets of model.
-        self.targets = []
-        self._feed_targets = []
-        for i in range(len(self.outputs)):
-            if i in skip_indices:
-                self.targets.append(None)
-            else:
-                shape = self.internal_output_shapes[i]
-                name = self.output_names[i]
-                target = K.placeholder(ndim=len(shape),
-                                       name=name + '_target',
-                                       sparse=K.is_sparse(self.outputs[i]),
-                                       dtype=K.dtype(self.outputs[i]))
-                self.targets.append(target)
-                self._feed_targets.append(target)
 
         # Prepare metrics.
         self.metrics = metrics
+        self.weighted_metrics = weighted_metrics
         self.metrics_names = ['loss']
         self.metrics_tensors = []
 
         # Compute total loss.
         total_loss = None
-        for i in range(len(self.outputs)):
-            if i in skip_indices:
-                continue
-            y_true = self.targets[i]
-            y_pred = self.outputs[i]
-            weighted_loss = weighted_losses[i]
-            sample_weight = sample_weights[i]
-            mask = masks[i]
-            loss_weight = loss_weights_list[i]
-            output_loss = weighted_loss(y_true, y_pred,
-                                        sample_weight, mask)
-            if len(self.outputs) > 1:
-                self.metrics_tensors.append(output_loss)
-                self.metrics_names.append(self.output_names[i] + '_loss')
+        with K.name_scope('loss'):
+            for i in range(len(self.outputs)):
+                if i in skip_target_indices:
+                    continue
+                y_true = self.targets[i]
+                y_pred = self.outputs[i]
+                weighted_loss = weighted_losses[i]
+                sample_weight = sample_weights[i]
+                mask = masks[i]
+                loss_weight = loss_weights_list[i]
+                with K.name_scope(self.output_names[i] + '_loss'):
+                    output_loss = weighted_loss(y_true, y_pred,
+                                                sample_weight, mask)
+                if len(self.outputs) > 1:
+                    self.metrics_tensors.append(output_loss)
+                    self.metrics_names.append(self.output_names[i] + '_loss')
+                if total_loss is None:
+                    total_loss = loss_weight * output_loss
+                else:
+                    total_loss += loss_weight * output_loss
             if total_loss is None:
-                total_loss = loss_weight * output_loss
-            else:
-                total_loss += loss_weight * output_loss
-        if total_loss is None:
-            if not self.losses:
-                raise RuntimeError('The model cannot be compiled '
-                                   'because it has no loss to optimize.')
-            else:
-                total_loss = 0.
+                if not self.losses:
+                    raise RuntimeError('The model cannot be compiled '
+                                       'because it has no loss to optimize.')
+                else:
+                    total_loss = 0.
 
-        # Add regularization penalties
-        # and other layer-specific losses.
-        for loss_tensor in self.losses:
-            total_loss += loss_tensor
+            # Add regularization penalties
+            # and other layer-specific losses.
+            for loss_tensor in self.losses:
+                total_loss += loss_tensor
 
         # List of same size as output_names.
         # contains tuples (metrics for output, names of metrics).
         nested_metrics = _collect_metrics(metrics, self.output_names)
+        nested_weighted_metrics = _collect_metrics(weighted_metrics, self.output_names)
 
-        def append_metric(layer_num, metric_name, metric_tensor):
+        def append_metric(layer_index, metric_name, metric_tensor):
             """Helper function used in loop below."""
             if len(self.output_names) > 1:
-                metric_name = self.output_layers[layer_num].name + '_' + metric_name
+                metric_name = self.output_layers[layer_index].name + '_' + metric_name
             self.metrics_names.append(metric_name)
             self.metrics_tensors.append(metric_tensor)
 
-        for i in range(len(self.outputs)):
-            if i in skip_indices:
-                continue
-            y_true = self.targets[i]
-            y_pred = self.outputs[i]
-            output_metrics = nested_metrics[i]
-            for metric in output_metrics:
-                if metric == 'accuracy' or metric == 'acc':
-                    # custom handling of accuracy
-                    # (because of class mode duality)
-                    output_shape = self.internal_output_shapes[i]
-                    acc_fn = None
-                    if (output_shape[-1] == 1 or
-                       self.loss_functions[i] == losses.binary_crossentropy):
-                        # case: binary accuracy
-                        acc_fn = metrics_module.binary_accuracy
-                    elif self.loss_functions[i] == losses.sparse_categorical_crossentropy:
-                        # case: categorical accuracy with sparse targets
-                        acc_fn = metrics_module.sparse_categorical_accuracy
-                    else:
-                        acc_fn = metrics_module.categorical_accuracy
+        with K.name_scope('metrics'):
+            for i in range(len(self.outputs)):
+                if i in skip_target_indices:
+                    continue
 
-                    masked_fn = _masked_objective(acc_fn)
-                    append_metric(i, 'acc', masked_fn(y_true, y_pred, mask=masks[i]))
-                else:
-                    metric_fn = metrics_module.get(metric)
-                    masked_metric_fn = _masked_objective(metric_fn)
-                    metric_result = masked_metric_fn(y_true, y_pred, mask=masks[i])
-                    metric_result = {
-                        metric_fn.__name__: metric_result
-                    }
-                    for name, tensor in six.iteritems(metric_result):
-                        append_metric(i, name, tensor)
+                y_true = self.targets[i]
+                y_pred = self.outputs[i]
+                weights = sample_weights[i]
+                output_metrics = nested_metrics[i]
+                output_weighted_metrics = nested_weighted_metrics[i]
+
+                def handle_metrics(metrics, weights=None):
+                    metric_name_prefix = 'weighted_' if weights is not None else ''
+
+                    for metric in metrics:
+                        if metric == 'accuracy' or metric == 'acc':
+                            # custom handling of accuracy
+                            # (because of class mode duality)
+                            output_shape = self.internal_output_shapes[i]
+                            if (output_shape[-1] == 1 or
+                               self.loss_functions[i] == losses.binary_crossentropy):
+                                # case: binary accuracy
+                                acc_fn = metrics_module.binary_accuracy
+                            elif self.loss_functions[i] == losses.sparse_categorical_crossentropy:
+                                # case: categorical accuracy with sparse targets
+                                acc_fn = metrics_module.sparse_categorical_accuracy
+                            else:
+                                acc_fn = metrics_module.categorical_accuracy
+
+                            weighted_metric_fn = _weighted_masked_objective(acc_fn)
+                            metric_name = metric_name_prefix + 'acc'
+                        else:
+                            metric_fn = metrics_module.get(metric)
+                            weighted_metric_fn = _weighted_masked_objective(metric_fn)
+                            metric_name = metric_name_prefix + metric_fn.__name__
+
+                        with K.name_scope(metric_name):
+                            metric_result = weighted_metric_fn(y_true, y_pred,
+                                                               weights=weights,
+                                                               mask=masks[i])
+                        append_metric(i, metric_name, metric_result)
+
+                handle_metrics(output_metrics)
+                handle_metrics(output_weighted_metrics, weights=weights)
 
         # Prepare gradient updates and state updates.
         self.total_loss = total_loss
         self.sample_weights = sample_weights
         self._feed_sample_weights = []
         for i in range(len(self.sample_weights)):
-            if i not in skip_indices:
+            if i not in skip_target_weighing_indices:
                 self._feed_sample_weights.append(sample_weights[i])
 
         # Functions for train, test and predict will
@@ -931,16 +953,18 @@ class Model(Container):
             if self.uses_learning_phase and not isinstance(K.learning_phase(), int):
                 inputs += [K.learning_phase()]
 
-            training_updates = self.optimizer.get_updates(
-                params=self._collected_trainable_weights,
-                loss=self.total_loss)
-            updates = self.updates + training_updates
-            # Gets loss and metrics. Updates weights at each call.
-            self.train_function = K.function(inputs,
-                                             [self.total_loss] + self.metrics_tensors,
-                                             updates=updates,
-                                             name='train_function',
-                                             **self._function_kwargs)
+            with K.name_scope('training'):
+                with K.name_scope(self.optimizer.__class__.__name__):
+                    training_updates = self.optimizer.get_updates(
+                        params=self._collected_trainable_weights,
+                        loss=self.total_loss)
+                updates = self.updates + training_updates
+                # Gets loss and metrics. Updates weights at each call.
+                self.train_function = K.function(inputs,
+                                                 [self.total_loss] + self.metrics_tensors,
+                                                 updates=updates,
+                                                 name='train_function',
+                                                 **self._function_kwargs)
 
     def _make_test_function(self):
         if not hasattr(self, 'test_function'):
